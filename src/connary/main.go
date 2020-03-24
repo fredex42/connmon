@@ -124,6 +124,30 @@ func IsOverThreshold(recordsList *[]Record, threshold float64) bool {
 	return (*recordsList)[0].value > threshold
 }
 
+func SendAlertWithRetry(matchFieldPtr *string, matchFieldValuePtr *string, failureThresholdPtr *float64, estimatedFailureSeconds float64, recordList *[]Record, pdCommunicator *PagerDutyCommunicator) {
+	alertSummary := fmt.Sprintf("%s %s is out of range at %f", *matchFieldPtr, *matchFieldValuePtr, (*recordList)[0].value)
+	requestBody, makeBodyErr := pdCommunicator.MakeBody(alertSummary, time.Now(), *matchFieldValuePtr, (*recordList)[0].value, *failureThresholdPtr, estimatedFailureSeconds)
+	if makeBodyErr == nil {
+		response, err := pdCommunicator.SendRequest(requestBody)
+		if err != nil {
+			log.Panic("ERROR: could not send request: ", err)
+		} else {
+			if !response.IsSuccess() && response.ShouldRetry() {
+				log.Printf("PD is rejecting as too many requests, retrying in 5 seconds")
+				time.Sleep(5 * time.Second)
+				SendAlertWithRetry(matchFieldPtr, matchFieldValuePtr, failureThresholdPtr, estimatedFailureSeconds, recordList, pdCommunicator)
+			} else if !response.IsSuccess() {
+				log.Printf("ERROR PD rejected notification: %s %s", response.GetStatus(), response.GetMessage())
+			} else {
+				successResponse := response.(PdAcceptedResponse)
+				log.Printf("Registered message, dedup key is %s", successResponse.DedupKey)
+			}
+		}
+	} else {
+		log.Panic("could not make body for PD alert: ", makeBodyErr)
+	}
+}
+
 func main() {
 	esHostPtr := flag.String("es-host", "http://localhost:9200", "URI of ElasticSearch host to connect to")
 	indexNamePtr := flag.String("index-name", "db_connection_metrix", "Elasticsearch index to use")
@@ -134,7 +158,25 @@ func main() {
 	countFieldThresholdPtr := flag.Float64("threshold", 1, "Alert if the value of count-field is higher than this number")
 	failureThresholdPtr := flag.Float64("failure-threshold", 200, "Assume failure if the count gets this high. Used to estimate time-to-failure")
 	sampleLengthPtr := flag.Int("sample-length", 100, "When performing time-to-failure estimate, sample this many records")
+	//continueousDelayPtr := flag.Int("continuous-delay", 0, "If set, then run continously; checking at an interval of this many seconds")
 	flag.Parse()
+
+	pdKey := os.Getenv("PAGERDUTY_KEY")
+	if pdKey == "" {
+		log.Print("You must specify a valid pagerduty key in the PAGERDUTY_KEY environment variable")
+		os.Exit(1)
+	}
+
+	pdService := os.Getenv("PAGERDUTY_SERVICE")
+	if pdService == "" {
+		log.Print("You must specify a valid pagerduty service id in the PAGERDUTY_SERVICE environment variable")
+		os.Exit(1)
+	}
+
+	pdCommunicator := &PagerDutyCommunicator{
+		ApiKey:    pdKey,
+		ServiceId: pdService,
+	}
 
 	ctx := context.Background()
 
@@ -149,12 +191,12 @@ func main() {
 		log.Fatal(err)
 	}
 
-	res, err := esConn.Info()
-	if err != nil {
-		log.Fatal(err)
+	_, connErr := esConn.Info()
+	if connErr != nil {
+		log.Fatal(connErr)
 	}
 
-	log.Println(res)
+	//log.Println(res)
 	//log.Println(data)
 
 	recordList, fetchErr := RequestRecords(indexNamePtr, matchFieldPtr, matchFieldValuePtr, timestampFieldPtr, countFieldPtr, sampleLengthPtr, ctx, esConn)
@@ -166,8 +208,9 @@ func main() {
 
 	if IsOverThreshold(&recordList, *countFieldThresholdPtr) {
 		estimatedFailureSeconds := EstimateTimeToFailure(&recordList, *failureThresholdPtr)
-		SendPdAlert(*matchFieldPtr, *matchFieldValuePtr, recordList[0].value, estimatedFailureSeconds)
+		SendAlertWithRetry(matchFieldPtr, matchFieldValuePtr, failureThresholdPtr, estimatedFailureSeconds, &recordList, pdCommunicator)
+		//SendPdAlert(*matchFieldPtr, *matchFieldValuePtr, recordList[0].value, estimatedFailureSeconds)
 	} else {
-
+		log.Printf("%s %s is currently in-range at %f", *matchFieldPtr, *matchFieldValuePtr, recordList[0].value)
 	}
 }
